@@ -18,6 +18,8 @@ They are marked xfail and flip to passing as you implement each function.
 
 from __future__ import annotations
 
+import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from agent import db
@@ -52,8 +54,20 @@ def get_policy(ctx: AuthContext, policy_id: str) -> dict[str, Any]:
     Implementation notes:
         agent.helpcenter.load_policy_docs() returns every parsed doc.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement get_policy")
+    for doc in load_policy_docs():
+        if doc.policy_id == policy_id:
+            return {
+                "ok": True,
+                "policy_id": doc.policy_id,
+                "title": doc.title,
+                "audience": doc.audience,
+                "body": doc.body,
+            }
+    return {
+        "ok": False,
+        "error": "not_found",
+        "reason": f"no policy with id '{policy_id}'",
+    }
 
 
 def search_products(
@@ -95,8 +109,40 @@ def search_products(
         agent.db.list_products(conn, store_id) gives the candidate set.
         Use `with db.connection() as conn:` to close the database automatically.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement search_products")
+    if not query or not query.strip():
+        return {"ok": False, "error": "invalid_argument", "reason": "query must not be empty"}
+    if max_price_usd is not None and max_price_usd <= 0:
+        return {
+            "ok": False,
+            "error": "invalid_argument",
+            "reason": f"max_price_usd must be positive, got {max_price_usd}",
+        }
+
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+
+    with db.connection() as conn:
+        store_id = None
+        if store is not None:
+            found = db.get_store_by_name(conn, store)
+            if found is None:
+                return {"ok": False, "error": "not_found", "reason": f"no store named '{store}'"}
+            store_id = found.id
+        candidates = db.list_products(conn, store_id)
+
+    words = query.lower().split()
+    matches = [
+        p
+        for p in candidates
+        if all(w in f"{p.title} {p.description}".lower() for w in words)
+        and (max_price_usd is None or p.price_usd <= max_price_usd)
+    ]
+
+    matches.sort(key=lambda p: (p.price_usd, p.id))
+    products = [
+        {"product_id": p.id, "store_id": p.store_id, "title": p.title, "price_usd": p.price_usd}
+        for p in matches[:limit]
+    ]
+    return {"ok": True, "products": products, "count": len(products)}
 
 
 def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
@@ -121,8 +167,20 @@ def list_my_orders(ctx: AuthContext) -> dict[str, Any]:
         scope is baked into which query you run. That is the point of the
         tool: the model cannot ask for someone else's orders through it.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement list_my_orders")
+    if ctx.role == "shopper":
+        with db.connection() as conn:
+            orders = db.list_orders_for_user(conn, ctx.user_id, limit=DEFAULT_ORDER_LIMIT)
+    elif ctx.role == "merchant":
+        with db.connection() as conn:
+            orders = db.list_orders_for_store(conn, ctx.store_id, limit=DEFAULT_ORDER_LIMIT)
+    else:
+        return {
+            "ok": False,
+            "error": "invalid_argument",
+            "reason": "support staff have no orders of their own; look up a specific order with get_order",
+        }
+    public = [o.to_public_dict() for o in orders]
+    return {"ok": True, "orders": public, "count": len(public)}
 
 
 def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]:
@@ -167,8 +225,47 @@ def cancel_order(ctx: AuthContext, order_id: int, reason: str) -> dict[str, Any]
     paused = kill_switch("cancel_order")
     if paused is not None:
         return {"ok": False, "error": "paused", "reason": paused}
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement cancel_order")
+    with db.connection() as conn:
+        order = db.get_order(conn, order_id)
+        if order is None:
+            return {"ok": False, "error": "not_found", "reason": f"no order #{order_id}"}
+        if not can_cancel_order(ctx, order.user_id, order.store_id):
+            return permission_denied(
+                f"role '{ctx.role}' (user {ctx.user_id}) may not cancel order #{order_id}"
+            )
+        if order.status != "placed":
+            return {
+                "ok": False,
+                "error": "not_eligible",
+                "reason": (
+                    f"order #{order_id} is '{order.status}'; "
+                    "orders can be cancelled only before shipment"
+                ),
+            }
+        db.set_order_status(conn, order_id, "cancelled")
+    return {"ok": True, "order_id": order_id, "status": "cancelled"}
+
+
+# Words customers say that aren't product names; ignored when matching.
+_FIND_ORDER_FILLER = {
+    "the", "a", "an", "and", "i", "my", "me", "that", "this", "these", "those",
+    "bought", "ordered", "order", "orders", "purchased", "got", "last", "week",
+    "month", "year", "ago", "from", "for", "of", "some", "one", "item", "thing",
+    "where", "is", "was", "which", "with",
+}
+_FIND_ORDER_MIN_SIMILARITY = 0.8  # 80% similar counts as a match ("speker" ~ "speaker")
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+def _title_matches(query_words: list[str], title: str) -> bool:
+    return any(
+        SequenceMatcher(None, q, t).ratio() >= _FIND_ORDER_MIN_SIMILARITY
+        for q in query_words
+        for t in _words(title)
+    )
 
 
 def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
@@ -202,5 +299,23 @@ def find_order(ctx: AuthContext, query: str) -> dict[str, Any]:
         (at most 5), each as the dict returned by agent.db. If no orders
         match, return {"ok": True, "orders": []}.
     """
-    ### YOUR CODE HERE (HW1)
-    raise NotImplementedError("HW1: implement find_order")
+    if ctx.role == "shopper" and ctx.user_id is not None:
+        scope: dict[str, Any] = {"user_id": ctx.user_id}
+    elif ctx.role == "merchant" and ctx.store_id is not None:
+        scope = {"store_id": ctx.store_id}
+    elif ctx.role == "support":
+        scope = {"all_orders": True}
+    else:
+        return permission_denied(
+            f"role '{ctx.role}' cannot search orders without a valid identity"
+        )
+
+    query_words = [w for w in _words(query) if len(w) >= 3 and w not in _FIND_ORDER_FILLER]
+    if not query_words:
+        return {"ok": True, "orders": []}
+
+    with db.connection() as conn:
+        candidates = db.list_order_search_candidates(conn, **scope)
+        titles = {p.id: p.title for p in db.list_products(conn)}
+    matches = [o for o in candidates if _title_matches(query_words, titles.get(o.product_id, ""))]
+    return {"ok": True, "orders": [o.to_public_dict() for o in matches[:5]]}
